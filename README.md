@@ -1,0 +1,1 @@
+# Classificador-de-Sentimento-em-Python
