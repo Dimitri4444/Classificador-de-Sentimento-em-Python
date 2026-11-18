@@ -1,0 +1,143 @@
+"""Análise de erros: onde e por que o modelo erra.
+
+Usa previsões out-of-fold: cada avaliação é prevista por um modelo que não
+a viu durante o treino, então os erros refletem o desempenho em dados novos.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from sklearn.base import clone
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.pipeline import Pipeline
+
+# Características linguísticas que costumam dificultar a análise de sentimento.
+# As regexes tratam 'não' e 'nao' (texto informal sem acento).
+SEGMENTOS_REGEX = {
+    "negação (não/nunca/nem/jamais)": r"\b(?:n[aã]o|nunca|nem|jamais)\b",
+    "contraste (mas/porém/contudo/embora)": r"\b(?:mas|por[eé]m|contudo|embora|entretanto|todavia)\b",
+    "elogio + negação (ex.: 'não é bom')": (
+        r"(?=.*\b(?:bom|boa|[oó]timo|excelente|gostei|recomendo|perfeito|lindo)\b)"
+        r"(?=.*\b(?:n[aã]o|nunca)\b)"
+    ),
+    "menciona entrega/prazo/atraso": r"\b(?:entrega|entregue|prazo|atras\w+|demor\w+|chegou|correios|transportadora)\b",
+    "menciona vendedor/loja/atendimento": r"\b(?:vendedor|loja|atendimento|sac|site)\b",
+    "menciona 'recomendo'": r"\brecomendo\b",
+    "tem ponto de exclamação": r"!",
+    "tem ponto de interrogação": r"\?",
+    "expressão de dúvida/ressalva (poderia/deveria/pena)": r"\b(?:poderia|deveria|pena|infelizmente|esperava)\b",
+}
+
+FAIXAS_TAMANHO = [
+    ("1-3 palavras", 0, 3),
+    ("4-10 palavras", 4, 10),
+    ("11-30 palavras", 11, 30),
+    ("31+ palavras", 31, np.inf),
+]
+
+
+def previsoes_out_of_fold(pipe: Pipeline, X: pd.Series, y: pd.Series, cv: StratifiedKFold) -> pd.DataFrame:
+    """Previsão (e probabilidade) de cada avaliação, feita por um modelo que não a viu no treino."""
+    proba = cross_val_predict(pipe, X, y, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
+    previsto = (proba >= 0.5).astype(int)
+
+    df = pd.DataFrame({"texto": X.values, "rotulo": y.values})
+    df["previsto"] = previsto
+    df["prob_positivo"] = proba
+    df["confianca"] = np.where(previsto == 1, proba, 1 - proba)
+    df["erro"] = df["previsto"] != df["rotulo"]
+    df["tipo_erro"] = np.select(
+        [(df["rotulo"] == 0) & (df["previsto"] == 1), (df["rotulo"] == 1) & (df["previsto"] == 0)],
+        ["falso_positivo", "falso_negativo"],
+        default="",
+    )
+    df["n_palavras"] = df["texto"].str.split().str.len()
+    return df
+
+
+def relatorio_classificacao(df: pd.DataFrame) -> str:
+    return classification_report(
+        df["rotulo"], df["previsto"], target_names=["negativo", "positivo"], digits=4
+    )
+
+
+def matriz_confusao(df: pd.DataFrame) -> pd.DataFrame:
+    cm = confusion_matrix(df["rotulo"], df["previsto"], labels=[0, 1])
+    return pd.DataFrame(
+        cm,
+        index=["real_negativo", "real_positivo"],
+        columns=["previsto_negativo", "previsto_positivo"],
+    )
+
+
+def _linha_segmento(grupo: str, nome: str, df: pd.DataFrame, mask: pd.Series, taxa_geral: float) -> dict:
+    sub = df[mask]
+    n = len(sub)
+    if n == 0:
+        return {"grupo": grupo, "segmento": nome, "n": 0}
+    return {
+        "grupo": grupo,
+        "segmento": nome,
+        "n": n,
+        "pct_positivas": (sub["rotulo"] == 1).mean(),
+        "taxa_erro": sub["erro"].mean(),
+        "taxa_falso_positivo": (sub["tipo_erro"] == "falso_positivo").mean(),
+        "taxa_falso_negativo": (sub["tipo_erro"] == "falso_negativo").mean(),
+        "dif_vs_taxa_geral": sub["erro"].mean() - taxa_geral,
+    }
+
+
+def erros_por_segmento(df: pd.DataFrame) -> pd.DataFrame:
+    """Taxa de erro por tamanho do texto, por classe real e por característica linguística."""
+    taxa_geral = df["erro"].mean()
+    linhas = [_linha_segmento("geral", "todas as avaliações", df, pd.Series(True, index=df.index), taxa_geral)]
+
+    for nome, minimo, maximo in FAIXAS_TAMANHO:
+        mask = (df["n_palavras"] >= minimo) & (df["n_palavras"] <= maximo)
+        linhas.append(_linha_segmento("tamanho", nome, df, mask, taxa_geral))
+
+    for nome, valor in (("classe real = negativa", 0), ("classe real = positiva", 1)):
+        linhas.append(_linha_segmento("classe", nome, df, df["rotulo"] == valor, taxa_geral))
+
+    for nome, padrao in SEGMENTOS_REGEX.items():
+        mask = df["texto"].str.contains(padrao, regex=True)
+        linhas.append(_linha_segmento("linguístico", nome, df, mask, taxa_geral))
+
+    tabela = pd.DataFrame(linhas)
+    # Segmentos que não aparecem no dataset não trazem informação
+    return tabela[tabela["n"] > 0].reset_index(drop=True)
+
+
+def termos_mais_pesados(pipe: Pipeline, X: pd.Series, y: pd.Series, n: int = 25) -> pd.DataFrame:
+    """Termos com maior peso na regressão logística (treinada com todos os dados)."""
+    modelo = clone(pipe).fit(X, y)
+    vocabulario = np.array(modelo.named_steps["vetorizador"].get_feature_names_out())
+    coef = modelo.named_steps["clf"].coef_[0]
+    ordem = np.argsort(coef)
+
+    negativos = ordem[:n]
+    positivos = ordem[::-1][:n]
+    return pd.concat([
+        pd.DataFrame({"classe": "negativo", "posicao": range(1, n + 1),
+                      "termo": vocabulario[negativos], "coeficiente": coef[negativos]}),
+        pd.DataFrame({"classe": "positivo", "posicao": range(1, n + 1),
+                      "termo": vocabulario[positivos], "coeficiente": coef[positivos]}),
+    ], ignore_index=True)
+
+
+def exemplos_confiantes(df: pd.DataFrame, n: int = 30) -> pd.DataFrame:
+    """Os erros em que o modelo estava mais confiante, por tipo de erro.
+
+    São os melhores candidatos para leitura manual: costumam revelar ironia,
+    rótulos duvidosos ou termos enganosos.
+    """
+    erros = df[df["erro"]]
+    partes = [
+        erros[erros["tipo_erro"] == tipo].sort_values("confianca", ascending=False).head(n)
+        for tipo in ("falso_positivo", "falso_negativo")
+    ]
+    return pd.concat(partes, ignore_index=True)[
+        ["tipo_erro", "confianca", "rotulo", "previsto", "n_palavras", "texto"]
+    ]
